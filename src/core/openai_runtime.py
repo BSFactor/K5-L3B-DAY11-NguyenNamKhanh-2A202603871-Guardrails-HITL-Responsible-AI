@@ -29,8 +29,15 @@ class OpenAIAgent:
 
 
 @dataclass
-class _MockInvocationContext:
-    user_id: str = "student"
+class _PluginInvocationContext:
+    user_id: str
+
+
+@dataclass(frozen=True)
+class ChatOutcome:
+    text: str
+    blocked_by: str | None = None
+    output_modified: bool = False
 
 
 @dataclass
@@ -45,21 +52,31 @@ class OpenAIRunner:
     client_kwargs: dict = field(default_factory=dict)
     input_hooks: list[Callable[[str], str | None]] = field(default_factory=list)
     output_hooks: list[Callable[[str], str]] = field(default_factory=list)
+    completion_client: Any = None
 
     def _client(self):
+        if self.completion_client is not None:
+            return self.completion_client
+
         from openai import OpenAI
 
         return OpenAI(**(self.client_kwargs or {}))
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+        return (await self.chat_with_outcome(agent, user_message)).text
+
+    async def chat_with_outcome(
+        self, agent: OpenAIAgent, user_message: str, *, user_id: str = "student",
+    ) -> ChatOutcome:
+        """Run the chat and expose the guardrail decision to pipeline observers."""
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
-                return blocked
+                return ChatOutcome(blocked, blocked_by="input_hook")
 
-        block_msg = await self._run_input_plugins(user_message)
-        if block_msg is not None:
-            return block_msg
+        blocked = await self._run_input_plugins(user_message, user_id)
+        if blocked is not None:
+            return blocked
 
         client = self._client()
         completion = client.chat.completions.create(
@@ -75,10 +92,10 @@ class OpenAIRunner:
         for hook in self.output_hooks:
             text = hook(text)
 
-        text = await self._run_output_plugins(text)
-        return text
+        filtered = await self._run_output_plugins(text)
+        return ChatOutcome(filtered, output_modified=filtered != text)
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(self, user_message: str, user_id: str) -> ChatOutcome | None:
         if not self.plugins:
             return None
         try:
@@ -90,7 +107,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _PluginInvocationContext(user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
@@ -103,7 +120,8 @@ class OpenAIRunner:
                 result = cb(invocation_context=ctx, user_message=user_content)
             if result is None:
                 continue
-            return _content_to_text(result)
+            layer = getattr(plugin, "name", type(plugin).__name__)
+            return ChatOutcome(_content_to_text(result), blocked_by=layer)
         return None
 
     async def _run_output_plugins(self, text: str) -> str:

@@ -1,15 +1,15 @@
 """
-Assignment 11 — Monitoring & Alerts starter (TODO).
+Assignment 11 — Monitoring & Alerts.
 
 Tracks block rate, rate-limit hits, judge fail rate.
 Fires alerts when thresholds are exceeded.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from assignment._files import write_json
 
 def default_metrics_path() -> str:
     """Always resolve to <repo>/outputs/… (safe when cwd is src/)."""
@@ -42,16 +42,24 @@ class MonitoringAlert:
     judge_fails: int = 0
 
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Refresh the active alerts from current counters."""
+        rates = self.snapshot()
+        thresholds = {
+            "block_rate": self.block_rate_threshold,
+            "rate_limit_hits": self.rate_limit_hit_threshold,
+            "judge_fail_rate": self.judge_fail_rate_threshold,
+        }
+        self.alerts[:] = [
+            Alert(metric, rates[metric], threshold, f"{metric} exceeded {threshold:g}.")
+            for metric, threshold in thresholds.items()
+            if rates[metric] > threshold
+        ]
+        return self.alerts.copy()
 
-    def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+    def export_json(self, filepath: str | Path | None = None):
+        """Write current counters and alerts under the repository's outputs directory."""
+        self.check_metrics()
+        write_json(filepath or default_metrics_path(), self.snapshot())
 
     def snapshot(self) -> dict:
         block_rate = (
@@ -70,13 +78,5 @@ class MonitoringAlert:
             "judge_checks": self.judge_checks,
             "judge_fails": self.judge_fails,
             "judge_fail_rate": judge_fail_rate,
-            "alerts": [
-                {
-                    "metric": a.metric,
-                    "value": a.value,
-                    "threshold": a.threshold,
-                    "message": a.message,
-                }
-                for a in self.alerts
-            ],
+            "alerts": [asdict(alert) for alert in self.alerts],
         }

@@ -6,6 +6,29 @@
 
 ---
 
+## Thông tin bài nộp
+
+- **Họ và tên** — Nguyễn Nam Khánh
+- **MSSV** — 2A202603871
+
+### Cách chạy
+
+Sau khi cài dependencies và cấu hình `.env` theo mục **Cách bắt đầu**, kích hoạt môi trường ảo và chạy từ thư mục gốc repo.
+
+```bash
+python src/main.py --part 2
+python src/main.py --part 3
+```
+
+Checkpoint 3 tạo `outputs/results.json`. Xem mục **Checkpoint 4** trong [CHECKPOINTS.md](CHECKPOINTS.md) để tạo `outputs/attack_results.json`. Khi đã có cả hai file, chạy tự kiểm:
+
+```bash
+python -m pytest tests/smoke tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+---
+
 ## Thời lượng
 
 | Phần | Thời gian |

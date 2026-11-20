@@ -12,14 +12,47 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+
+_REDACTED = "[REDACTED]"
+_NATIONAL_ID_NUMBER = r"(?:\d{12}|\d{9}|\d{3}(?:[ \t]+\d{3}){2,3})"
+_SENSITIVE_PATTERNS = {
+    "password": re.compile(
+        r"\b(?P<label>(?:password|mật khẩu)\b(?:[*_]{1,2})?"
+        r"(?:[ \t]*[:=][ \t]*(?:[*_]{1,2})?[ \t]*|[ \t]+(?:is|là)[ \t]+))"
+        r'''(?:\x60[^\x60\r\n]+\x60|"[^"\r\n]+"|'[^'\r\n]+'|'''
+        r"(?!\[REDACTED\]|\b(?:required|optional|case-sensitive|incorrect|invalid|"
+        r"expired|too|at least)\b)[^\s,;)\]]*[^\s,;.)\]])",
+        re.IGNORECASE,
+    ),
+    "api_key": re.compile(r"(?<!\w)sk-[a-z0-9_-]+", re.IGNORECASE),
+    "database_host": re.compile(
+        r"\b(?:[a-z0-9-]+\.)+internal(?::[0-9]+)?\b", re.IGNORECASE
+    ),
+    "protected_secret": re.compile(
+        "|".join(re.escape(value) for value in sorted(DEMO_SECRETS, key=len, reverse=True))
+        or r"(?!)",
+        re.IGNORECASE,
+    ),
+    "email": re.compile(r"(?<![\w.+%-])[\w.+%-]+@(?:[\w-]+\.)+[a-z]{2,}\b", re.IGNORECASE),
+    "phone": re.compile(r"(?<!\w)(?:0|\+84)[ .-]?[1-9](?:[ .-]?\d){8,9}(?!\w|[ .-]?\d)"),
+    # An explicit ID label takes priority over the currency exception.
+    "national_id": re.compile(
+        r"\b(?P<label>(?:CCCD|CMND|national[ \t]+ID)\b[ \t:=-]*)"
+        rf"{_NATIONAL_ID_NUMBER}\b"
+        rf"|\b{_NATIONAL_ID_NUMBER}\b(?![ \t]+[0-9]|[ \t]*(?:(?:VND|VNĐ|đồng)\b|₫))",
+        re.IGNORECASE,
+    ),
+}
 
 
 # ============================================================
 # Implement content_filter()
 #
 # Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
+# passwords, or other lab secrets.
 #
 # Return a dict with:
 # - "safe": True/False
@@ -28,7 +61,7 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter a response for PII and secrets.
 
     Args:
         response: The LLM's response text
@@ -39,21 +72,11 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    for name, pattern in _SENSITIVE_PATTERNS.items():
+        replacement = rf"\g<label>{_REDACTED}" if "label" in pattern.groupindex else _REDACTED
+        redacted, count = pattern.subn(replacement, redacted)
+        if count:
+            issues.append(f"{name}: {count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -133,7 +156,7 @@ async def llm_safety_check(response_text: str) -> dict:
 #
 # This plugin checks the agent's output BEFORE sending to the user.
 # Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
+# Applies content_filter() to the response text.
 #
 # NOTE: after_model_callback uses keyword-only arguments.
 #   - llm_response has a .content attribute (types.Content)
@@ -154,7 +177,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -172,16 +195,14 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
-
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role=llm_response.content.role or "model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+        return llm_response
 
 
 # ============================================================
@@ -205,10 +226,9 @@ def test_content_filter():
     for resp in test_responses:
         result = content_filter(resp)
         status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
+        print(f"  [{status}] '{result['redacted']}'")
         if result["issues"]:
             print(f"           Issues: {result['issues']}")
-            print(f"           Redacted: {result['redacted'][:80]}...")
 
 
 def load_lab_pii_dataset():
